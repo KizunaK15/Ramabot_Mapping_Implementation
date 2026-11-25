@@ -1,0 +1,15 @@
+# ROS 2 build artifacts
+build/
+install/
+log/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# File binary, firmware hasil compile & bag log besar
+*.bin
+*.elf
+*.bag
+*.db3
+*.mcap
+.DS_Store
