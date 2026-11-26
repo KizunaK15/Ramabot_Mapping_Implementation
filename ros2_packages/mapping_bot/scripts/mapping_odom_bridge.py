@@ -47,6 +47,8 @@ class MappingOdomBridge(Node):
 
         self.x = 0.0
         self.y = 0.0
+        self.theta = 0.0
+        self.rx_buffer = ""
 
         self.ser = serial.Serial()
         self.ser.port = port
@@ -61,8 +63,7 @@ class MappingOdomBridge(Node):
 
         self.last_log_time = time.time()
         self.get_logger().info(
-            f'Terhubung ke M5Stack Core Grey di {port} @ {baud} bps '
-            f'(M5Stack RK2 Fusion Odom + IMU, invert_yaw={self.invert_yaw})'
+            f'Terhubung ke M5Stack Core Grey di {port} @ {baud} bps (Baseline Clean, invert_yaw={self.invert_yaw})'
         )
 
         self.odom_pub = self.create_publisher(Odometry, '/odom', 20)
@@ -86,6 +87,8 @@ class MappingOdomBridge(Node):
             self.ser.write(b"RESET\n")
             self.x = 0.0
             self.y = 0.0
+            self.theta = 0.0
+            self.rx_buffer = ""
             response.success = True
             response.message = "Odometri & gyro heading M5Stack di-reset ke 0"
         except serial.SerialException as e:
@@ -95,12 +98,22 @@ class MappingOdomBridge(Node):
 
     def read_serial_loop(self):
         try:
+            if self.ser.in_waiting > 0:
+                chunk = self.ser.read(self.ser.in_waiting).decode('utf-8', errors='ignore')
+                self.rx_buffer += chunk
+
+            if '\n' not in self.rx_buffer:
+                return
+
+            lines = self.rx_buffer.split('\n')
+            self.rx_buffer = lines[-1]
+
             latest_parts = None
-            while self.ser.in_waiting > 0:
-                line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+            for raw_line in lines[:-1]:
+                line = raw_line.strip()
                 if line.startswith('ODO:'):
                     parts = line[4:].split(',')
-                    if len(parts) >= 5:
+                    if len(parts) >= 7:
                         latest_parts = parts
 
             if latest_parts is None:
@@ -112,6 +125,8 @@ class MappingOdomBridge(Node):
             theta = float(latest_parts[2]) * self.yaw_scale
             vx = float(latest_parts[3]) * self.linear_scale
             vth = float(latest_parts[4]) * self.yaw_scale
+            ticks_l = float(latest_parts[5])
+            ticks_r = float(latest_parts[6])
 
             if self.invert_linear:
                 raw_x = -raw_x
@@ -121,24 +136,20 @@ class MappingOdomBridge(Node):
             if self.invert_yaw:
                 theta = -theta
                 vth = -vth
-            theta = normalize_angle(theta)
 
             self.x = raw_x
             self.y = raw_y
-
-            ticks_l = float(latest_parts[5]) if len(latest_parts) >= 7 else 0.0
-            ticks_r = float(latest_parts[6]) if len(latest_parts) >= 7 else 0.0
+            self.theta = normalize_angle(theta)
 
             if now_sec - self.last_log_time >= 2.0:
                 self.last_log_time = now_sec
                 self.get_logger().info(
-                    f'ODOM -> x={self.x:.3f}m, y={self.y:.3f}m, yaw={math.degrees(theta):.1f} deg, ticks=({int(ticks_l)},{int(ticks_r)})'
+                    f'ODOM -> x={self.x:.3f}m, y={self.y:.3f}m, yaw={math.degrees(self.theta):.1f} deg, ticks=({int(ticks_l)},{int(ticks_r)})'
                 )
 
             now = self.get_clock().now().to_msg()
-            qx, qy, qz, qw = yaw_to_quaternion(theta)
+            qx, qy, qz, qw = yaw_to_quaternion(self.theta)
 
-            # 1. Broadcast TF odom -> base_footprint
             tf_msg = TransformStamped()
             tf_msg.header.stamp = now
             tf_msg.header.frame_id = self.odom_frame
@@ -152,7 +163,6 @@ class MappingOdomBridge(Node):
             tf_msg.transform.rotation.w = qw
             self.tf_broadcaster.sendTransform(tf_msg)
 
-            # 2. Publish /odom
             odom = Odometry()
             odom.header.stamp = now
             odom.header.frame_id = self.odom_frame
@@ -163,7 +173,6 @@ class MappingOdomBridge(Node):
             odom.pose.pose.orientation.y = qy
             odom.pose.pose.orientation.z = qz
             odom.pose.pose.orientation.w = qw
-
             odom.pose.covariance = [
                 0.01, 0.0,  0.0,  0.0,  0.0,  0.0,
                 0.0,  0.01, 0.0,  0.0,  0.0,  0.0,
@@ -172,23 +181,13 @@ class MappingOdomBridge(Node):
                 0.0,  0.0,  0.0,  0.0,  1e6,  0.0,
                 0.0,  0.0,  0.0,  0.0,  0.0,  0.001
             ]
-
             odom.twist.twist.linear.x = vx
             odom.twist.twist.angular.z = vth
-            odom.twist.covariance = [
-                0.01, 0.0,  0.0,  0.0,  0.0,  0.0,
-                0.0,  0.01, 0.0,  0.0,  0.0,  0.0,
-                0.0,  0.0,  1e6,  0.0,  0.0,  0.0,
-                0.0,  0.0,  0.0,  1e6,  0.0,  0.0,
-                0.0,  0.0,  0.0,  0.0,  1e6,  0.0,
-                0.0,  0.0,  0.0,  0.0,  0.0,  0.001
-            ]
-
+            odom.twist.covariance = odom.pose.covariance
             self.odom_pub.publish(odom)
 
-            # 3. Publish /joint_states untuk Wheel1 & Wheel2
             wheel_l = (ticks_l / self.ticks_per_rev) * 2.0 * math.pi
-            wheel_r = (ticks_r / self.ticks_per_rev) * 2.0 * math.pi if abs(ticks_r) > 5 else wheel_l
+            wheel_r = (ticks_r / self.ticks_per_rev) * 2.0 * math.pi
             if self.invert_linear:
                 wheel_l = -wheel_l
                 wheel_r = -wheel_r

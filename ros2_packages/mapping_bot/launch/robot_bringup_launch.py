@@ -24,7 +24,7 @@ def generate_launch_description():
     )
     invert_yaw_arg = DeclareLaunchArgument(
         "invert_yaw",
-        default_value="true",
+        default_value="false",
         description="Set true jika arah yaw serial berlawanan dengan putaran LiDAR"
     )
 
